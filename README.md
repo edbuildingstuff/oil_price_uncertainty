@@ -23,7 +23,7 @@ All shell commands below run from inside the `updated/` subdirectory unless note
 
 ## What this produces
 
-1. **OPU index** — monthly oil-price uncertainty index following Jurado, Ludvigson & Ng (2015), built from a dynamic factor model of 131 macro/financial predictors with Kim-Shephard-Chib (1998) stochastic-volatility forecast errors.
+1. **OPU index** — monthly oil-price uncertainty index following Jurado, Ludvigson & Ng (2015), built from a VAR of oil-market macro/financial predictors (FX, real activity, fundamentals, money, fuel factors) with Kim-Shephard-Chib (1998) stochastic-volatility forecast errors. The predictor panel follows Cross, Nguyen & Tran (2022) — ~13 oil-market predictors rather than the full JLN 131-series FRED-MD panel.
 2. **SVAR estimates** — 5-variable structural VAR (oil production growth, real economic activity, real oil price, inventory change, OPU) identified via the Inoue-Kilian (2013, 2018) sign + elasticity + dynamic-sign + narrative restrictions.
 3. **Figures** — OPU time series with annotated events, impulse responses, forecast-error variance decompositions.
 
@@ -40,7 +40,7 @@ The `fetch` stage pulls raw series from two public data providers. Each requires
 
 ### 1. FRED (Federal Reserve Economic Data, St. Louis Fed)
 
-Used for 131 macro/financial predictors, CPI, and the real-oil-price deflator.
+Used for the oil-market predictor panel, CPI, and the real-oil-price deflator.
 
 1. Go to https://fredaccount.stlouisfed.org/apikeys and create an account (email + password).
 2. After confirming your email, sign in and open https://fredaccount.stlouisfed.org/apikeys.
@@ -94,7 +94,7 @@ The `-u` flag forces unbuffered stdout so progress lines appear immediately on W
 
 ### Stage-by-stage detail
 
-**1. `fetch`** — Pulls FRED series (131 macro predictors + real oil price components), EIA world oil production, and Jurado-Ludvigson-Ng macro-uncertainty series. Cached on disk; re-runs skip already-downloaded series unless `--force` is passed.
+**1. `fetch`** — Pulls 15 FRED series (oil-market predictors + real oil price components) and 3 EIA series (refiner acquisition cost, world production, crude stocks). Cached on disk as parquet; re-runs skip already-downloaded series unless `--force` is passed. Cache freshness is 30 days.
 
 **2. `opu`** — Runs the full OPU construction: predictor selection (t-stat > 2.575), VAR forecast errors, 20 independent SV chains (100k iterations each), and the JLN uncertainty recursion. Chains run in parallel across workers. Defaults to all CPUs; cap with `--workers N`.
 
@@ -171,7 +171,7 @@ For reviewers who want to verify methodological fidelity without reading every m
 
 **OPU index construction** (`opu/uncertainty.py`, following Jurado, Ludvigson & Ng 2015):
 
-1. **Predictor panel** — 131 FRED-MD style macro/financial series plus EIA oil-market series. Transformations (log-differences, detrending, deseasonalization) follow `opu/transforms.py`, a direct port of the original `prepare_missing.m`.
+1. **Predictor panel** — 15 FRED + 3 EIA series, assembled into 13 predictor columns: 5 commodity-currency FX rates (AUD, CAD, CLP, NZD, ZAR), Kilian IGREA, EIA world production, EIA crude stocks, M1, CPI, and three fuel-group factors (PC1 of coal/gas_US/gas_EU, its square, and PC1 of squared fuels). Plus 3 oil-price dependents (RAC, WB energy index, WTI). Transformations (log-differences, detrending, deseasonalization) follow `opu/transforms.py`, a direct port of the original `prepare_missing.m`.
 2. **Factor extraction** — principal-components extraction with the Bai-Ng (2002) information criterion for factor count (`opu/factors.py`).
 3. **Predictor selection** — each candidate predictor is tested in a VAR(1) with the oil-price series. Predictors with Newey-West HAC t-statistic > 2.575 (99% significance) are retained (`opu/forecast_errors.py`, `TSTAT_THRESHOLD` in config).
 4. **Forecast errors** — one-step-ahead VAR residuals for oil price and each retained predictor.

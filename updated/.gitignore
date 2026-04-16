@@ -1,7 +1,9 @@
 .env
 __pycache__/
 *.pyc
+*.log
 .venv/
 artifacts/
+artifacts_mar2026/
 .claude/
 docs/superpowers/

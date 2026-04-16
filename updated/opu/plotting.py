@@ -23,6 +23,7 @@ OPU_EVENTS = {
     2014.5: "OPEC Collapse",
     2020.17: "COVID-19",
     2022.17: "Russia-Ukraine",
+    2026.17: "Hormuz Closure",
 }
 
 
