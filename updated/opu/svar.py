@@ -96,3 +96,64 @@ def load_svar_data() -> dict:
         "dates": dates[-len(y):],
         "Q_1": Q_1,
     }
+
+
+def setup_posterior(y: np.ndarray, p: int) -> dict:
+    """Compute Normal-Inverse-Wishart posterior parameters.
+
+    Diffuse prior: N0=0, S0=0, nu0=0.
+    """
+    t, n = y.shape
+    T = t - p
+
+    # Build VAR regressors
+    Y = y[p:, :]
+    lags = np.zeros((T, n * p))
+    for i in range(p):
+        lags[:, i * n : (i + 1) * n] = y[p - 1 - i : t - 1 - i, :]
+    X = np.column_stack([np.ones(T), lags])
+
+    Ydep = y[p:, :]
+    Bhat = np.linalg.solve(X.T @ X, X.T @ Ydep)
+    Sigmahat = (Ydep - X @ Bhat).T @ (Ydep - X @ Bhat) / T
+
+    # Diffuse prior
+    nu0 = 0
+    N0 = np.zeros((n * p + 1, n * p + 1))
+    S0 = np.zeros((n, n))
+    Bbar0 = np.zeros((n * p + 1, n))
+
+    # Posterior
+    nuT = T + nu0
+    NT = N0 + X.T @ X
+    BbarT = np.linalg.solve(NT, N0 @ Bbar0 + X.T @ X @ Bhat)
+    ST = (nu0 / nuT) * S0 + (T / nuT) * Sigmahat + \
+         (1 / nuT) * (Bhat - Bbar0).T @ N0 @ np.linalg.solve(NT, X.T) @ X @ (Bhat - Bbar0)
+
+    EvecB = BbarT.flatten(order="F")
+
+    return {
+        "nuT": nuT, "NT": NT, "BbarT": BbarT, "ST": ST,
+        "EvecB": EvecB, "Ydep": Ydep, "X": X,
+        "T": T, "n": n, "p": p,
+    }
+
+
+def draw_posterior(post: dict, rng) -> tuple:
+    """Draw (B, Sigma) from Normal-Inverse-Wishart posterior."""
+    n, p = post["n"], post["p"]
+    nuT, NT, ST = post["nuT"], post["NT"], post["ST"]
+    EvecB = post["EvecB"]
+
+    # Draw Sigma ~ IW(nuT, ST)
+    RANTR = np.linalg.cholesky(np.linalg.inv(ST)) @ rng.standard_normal((n, nuT)) / np.sqrt(nuT)
+    Sigma = np.linalg.inv(RANTR @ RANTR.T)
+
+    # Draw B | Sigma ~ MN(BbarT, Sigma x NT^{-1})
+    VvecB = np.kron(Sigma, np.linalg.inv(NT))
+    VvecB = (VvecB + VvecB.T) / 2
+    L = np.linalg.cholesky(VvecB)
+    vecB = EvecB + L @ rng.standard_normal(n * (n * p + 1))
+    B = vecB.reshape(1 + n * p, n, order="F").T
+
+    return B, Sigma, vecB

@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from opu.svar import load_svar_data
+from opu.svar import load_svar_data, setup_posterior, draw_posterior
 
 
 def test_load_svar_data_keys():
@@ -39,3 +39,64 @@ def test_load_svar_data_q1_aligned():
 def test_load_svar_data_dates_aligned():
     result = load_svar_data()
     assert len(result["dates"]) == len(result["y"])
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests for setup_posterior / draw_posterior (synthetic data only)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def small_var_data():
+    """Return synthetic (y, p) for a fast, well-conditioned VAR.
+
+    t=50, n=3, p=2 => T=48, k=1+n*p=7; well above k so X.T@X is full rank.
+    """
+    rng = np.random.default_rng(0)
+    y = rng.standard_normal((50, 3))
+    return y, 2
+
+
+def test_setup_posterior_keys(small_var_data):
+    y, p = small_var_data
+    post = setup_posterior(y, p)
+    expected_keys = {"nuT", "NT", "BbarT", "ST", "EvecB", "Ydep", "X", "T", "n", "p"}
+    assert set(post.keys()) == expected_keys
+
+
+def test_setup_posterior_shapes(small_var_data):
+    y, p = small_var_data
+    n = y.shape[1]
+    post = setup_posterior(y, p)
+    k = 1 + n * p  # number of regressors incl. constant
+    assert post["BbarT"].shape == (k, n)
+    assert post["ST"].shape == (n, n)
+    assert post["NT"].shape == (k, k)
+
+
+def test_draw_posterior_shapes(small_var_data):
+    y, p = small_var_data
+    n = y.shape[1]
+    post = setup_posterior(y, p)
+    rng = np.random.default_rng(42)
+    B, Sigma, vecB = draw_posterior(post, rng)
+    k = 1 + n * p
+    assert B.shape == (n, k)
+    assert Sigma.shape == (n, n)
+    assert vecB.shape == (n * k,)
+
+
+def test_draw_posterior_sigma_positive_definite(small_var_data):
+    y, p = small_var_data
+    post = setup_posterior(y, p)
+    rng = np.random.default_rng(7)
+    _, Sigma, _ = draw_posterior(post, rng)
+    # np.linalg.cholesky raises LinAlgError if Sigma is not PSD
+    np.linalg.cholesky(Sigma)
+
+
+def test_draw_posterior_different_seeds_differ(small_var_data):
+    y, p = small_var_data
+    post = setup_posterior(y, p)
+    B1, _, _ = draw_posterior(post, np.random.default_rng(1))
+    B2, _, _ = draw_posterior(post, np.random.default_rng(2))
+    assert not np.allclose(B1, B2)
