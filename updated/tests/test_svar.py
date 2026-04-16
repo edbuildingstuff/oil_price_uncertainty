@@ -131,3 +131,74 @@ def test_elasticity_valid():
     DSbar = 0.5
     ok = check_elasticity(B0inv, Q_1, DSbar)
     assert isinstance(ok, bool)
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests for opu.narrative (Task 13)
+# ---------------------------------------------------------------------------
+
+from opu.narrative import (
+    get_narrative_dates,
+    compute_historical_decomposition,
+    check_narrative_restrictions,
+)
+
+
+@pytest.fixture
+def narrative_synthetic():
+    """Synthetic data for narrative smoke tests: n=5, p=2, T=30."""
+    rng = np.random.default_rng(99)
+    n, p, T = 5, 2, 30
+    # Build sample dates covering 1979–1990 episode years (float years)
+    # Start at 1979.0, monthly spacing = 1/12
+    sample_dates = 1979.0 + np.arange(T) / 12.0
+    # B: (n, 1+n*p) reduced-form coefficients
+    k = 1 + n * p
+    B = rng.standard_normal((n, k)) * 0.05
+    # B0inv: (n, n) structural impact matrix (well-conditioned)
+    B0inv = np.eye(n) + rng.standard_normal((n, n)) * 0.1
+    # Ydep: (T, n)
+    Ydep = rng.standard_normal((T, n))
+    # X: (T, k)
+    X = np.column_stack([np.ones(T), rng.standard_normal((T, n * p))])
+    return sample_dates, B, B0inv, Ydep, X, n, p, T
+
+
+def test_get_narrative_dates_keys(narrative_synthetic):
+    sample_dates, *_ = narrative_synthetic
+    dates = get_narrative_dates(sample_dates)
+    expected_keys = {
+        "id_90M10", "id_90M06", "id_90M07",
+        "id_79M05", "id_79M12",
+        "id_85M12", "id_86M12",
+    }
+    assert set(dates.keys()) == expected_keys
+
+
+def test_get_narrative_dates_count(narrative_synthetic):
+    sample_dates, *_ = narrative_synthetic
+    dates = get_narrative_dates(sample_dates)
+    assert len(dates) == 7
+
+
+def test_compute_historical_decomposition_keys(narrative_synthetic):
+    sample_dates, B, B0inv, Ydep, X, n, p, T = narrative_synthetic
+    yhat = compute_historical_decomposition(B, B0inv, Ydep, X, n, p)
+    expected_keys = {"supply", "flow_demand", "speculative", "uncertainty"}
+    assert set(yhat.keys()) == expected_keys
+
+
+def test_compute_historical_decomposition_array_lengths(narrative_synthetic):
+    sample_dates, B, B0inv, Ydep, X, n, p, T = narrative_synthetic
+    yhat = compute_historical_decomposition(B, B0inv, Ydep, X, n, p)
+    for key, arr in yhat.items():
+        assert arr.shape == (T,), f"yhat['{key}'] has shape {arr.shape}, expected ({T},)"
+
+
+def test_check_narrative_restrictions_returns_bool(narrative_synthetic):
+    sample_dates, B, B0inv, Ydep, X, n, p, T = narrative_synthetic
+    yhat = compute_historical_decomposition(B, B0inv, Ydep, X, n, p)
+    dates = get_narrative_dates(sample_dates)
+    result = check_narrative_restrictions(yhat, dates, B0inv)
+    # Accept both Python bool and numpy bool_ (numpy comparisons return np.bool_)
+    assert isinstance(result, (bool, np.bool_))
