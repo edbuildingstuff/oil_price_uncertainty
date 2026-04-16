@@ -2,7 +2,24 @@
 
 Python replication and extension of Cross, Nguyen & Tran (2022), *"The Role of Precautionary and Speculative Demand in the Global Market for Crude Oil"*, with the sample extended from 1973M1–2018M6 to 1973M1–2025M12.
 
-The original code (MATLAB + R) lives under `../Codes_CNT_2022_JAE/`. This directory is a from-scratch Python port that preserves the original methodology while using current data vintages. See `docs/decisions.md` for the full record of design choices.
+This repository bundles three things: the original paper, the authors' MATLAB/R replication materials, and a from-scratch Python port that preserves the original methodology while using current data vintages.
+
+## Repository layout
+
+```
+.
+├── CNT_2022_JAE.pdf         Cross, Nguyen & Tran (2022) — the original paper
+├── Codes_CNT_2022_JAE/      Original MATLAB + R replication bundle (reference)
+└── updated/                 Python port with extended 1973–2025 sample
+    ├── opu/                 core library
+    ├── tests/               pytest suite
+    ├── reference/           copies of the original paper's outputs for validation
+    ├── artifacts/           fetched data, OPU/SVAR outputs, figures (gitignored)
+    ├── docs/decisions.md    decision log: scope, methodology, architecture, performance
+    └── run.py               CLI entry point
+```
+
+All shell commands below run from inside the `updated/` subdirectory unless noted otherwise. See `updated/docs/decisions.md` for the full record of design choices.
 
 ## What this produces
 
@@ -45,6 +62,7 @@ Rate limits: 5,000 requests per hour. The `fetch` stage makes fewer than 20 requ
 ### 3. Wire keys into the project
 
 ```bash
+cd updated/            # everything from here on runs inside the Python port
 cp .env.example .env
 # then edit .env and paste the two keys:
 #   FRED_API_KEY=<your 32-char key>
@@ -59,7 +77,7 @@ cp .env.example .env
 uv sync
 ```
 
-`uv sync` creates the virtual environment (`.venv/`) and installs pinned dependencies from `uv.lock`. This must succeed before any `run.py` command will work.
+`uv sync` creates the virtual environment (`updated/.venv/`) and installs pinned dependencies from `updated/uv.lock`. This must succeed before any `run.py` command will work.
 
 ## Running the full pipeline
 
@@ -98,7 +116,9 @@ uv run python -u run.py validate
 
 Runs the full 59-test suite under `tests/`. One test (`test_opu_against_reference`) is marked `xfail` — it documents an expected level-divergence from the original paper's outputs due to data-vintage shifts and the removal of `PNGASINDEXM` from FRED. Shape correlation with the reference is ~0.82; see **Known caveats** below.
 
-## Project layout
+## Python port layout
+
+Detail on the contents of `updated/` (the root layout is in **Repository layout** above):
 
 ```
 opu/                        core library
