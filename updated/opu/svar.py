@@ -157,3 +157,152 @@ def draw_posterior(post: dict, rng) -> tuple:
     B = vecB.reshape(1 + n * p, n, order="F").T
 
     return B, Sigma, vecB
+
+
+import multiprocessing as mp
+from opu.identification import (
+    check_sign_restrictions, check_elasticity,
+    check_dynamic_sign, compute_irf,
+)
+from opu.narrative import (
+    get_narrative_dates, compute_historical_decomposition,
+    check_narrative_restrictions,
+)
+
+
+def _worker_rotation(args):
+    """Worker: test a batch of QR rotations for one posterior draw."""
+    A, B, n, p, H, Q_1, DSbar, Ydep, X, narr_dates, start_rot, end_rot, seed = args
+    rng = np.random.default_rng(seed)
+
+    for r in range(start_rot, end_rot):
+        # QR rotation
+        Z = rng.standard_normal((n, n))
+        U, R = np.linalg.qr(Z)
+        for j in range(n):
+            if R[j, j] < 0:
+                U[:, j] = -U[:, j]
+
+        Atilde = A @ U
+
+        # S1: Sign restrictions
+        B0inv = check_sign_restrictions(Atilde)
+        if B0inv is None:
+            continue
+
+        # S2: Elasticity
+        if not check_elasticity(B0inv, Q_1, DSbar):
+            continue
+
+        # S3: Dynamic sign restrictions
+        irf = compute_irf(B, B0inv, n, p, H)
+        if not check_dynamic_sign(irf):
+            continue
+
+        # S4: Narrative restrictions
+        # Normalize supply shock to raise price
+        B0inv_n = B0inv.copy()
+        B0inv_n[:, 0] = -B0inv_n[:, 0]
+        yhat = compute_historical_decomposition(B, B0inv_n, Ydep, X, n, p)
+        if not check_narrative_restrictions(yhat, narr_dates, B0inv_n):
+            continue
+
+        return B0inv
+
+    return None
+
+
+def run_svar(resume: bool = False, workers: int = SVAR_N_WORKERS):
+    """Run full SVAR estimation with parallel rotation sampling."""
+    print("=== SVAR Estimation ===")
+
+    # Load data
+    data = load_svar_data()
+    y = data["y"]
+    Q_1 = data["Q_1"]
+
+    n = y.shape[1]
+    p = SVAR_P
+    DSbar = np.mean(y[:, 3])
+
+    # Posterior parameters
+    post = setup_posterior(y, p)
+
+    # Narrative dates
+    T_eff = post["T"]
+    sample_start = 1973 + 2 / 12 + (SVAR_P + 24) / 12
+    sample_dates = np.arange(T_eff) / 12 + sample_start
+    narr_dates = get_narrative_dates(sample_dates)
+
+    # Resume from checkpoint
+    accepted = []
+    checkpoint_path = SVAR_DIR / "checkpoint.npz"
+    if resume and checkpoint_path.exists():
+        ckpt = np.load(checkpoint_path, allow_pickle=True)
+        accepted = list(ckpt["accepted"])
+        print(f"Resumed from checkpoint: {len(accepted)} accepted draws")
+
+    rng = np.random.default_rng(SEED_SVAR + len(accepted))
+    total_attempts = 0
+
+    while len(accepted) < SVAR_TARGET_DRAWS:
+        total_attempts += 1
+
+        # Draw from posterior
+        B, Sigma, vecB = draw_posterior(post, rng)
+
+        # Stationarity check
+        A_comp = np.zeros((n * p, n * p))
+        A_comp[:n, :] = B[:, 1:]
+        if p > 1:
+            A_comp[n:, : n * (p - 1)] = np.eye(n * (p - 1))
+        max_root = np.max(np.abs(np.linalg.eigvals(A_comp)))
+        if max_root >= SVAR_ROOT_BOUND:
+            continue
+
+        A = np.linalg.cholesky(Sigma)
+
+        # Parallel rotation search
+        rots_per_worker = SVAR_ROTATIONS // workers
+        worker_args = []
+        for w in range(workers):
+            s = w * rots_per_worker
+            e = s + rots_per_worker
+            seed = rng.integers(0, 2**31)
+            worker_args.append((
+                A, B, n, p, SVAR_H, Q_1, DSbar,
+                post["Ydep"], post["X"], narr_dates,
+                s, e, seed,
+            ))
+
+        with mp.Pool(workers) as pool:
+            results = pool.map(_worker_rotation, worker_args)
+
+        # Check if any worker found an accepted rotation
+        for result in results:
+            if result is not None:
+                accepted.append({
+                    "vecB": vecB,
+                    "Sigma": Sigma.flatten(),
+                    "B0inv": result.flatten(),
+                })
+                print(f"Draw {len(accepted)}/{SVAR_TARGET_DRAWS} accepted "
+                      f"(attempt {total_attempts})")
+
+                # Checkpoint
+                np.savez(
+                    checkpoint_path,
+                    accepted=np.array(accepted, dtype=object),
+                    total_attempts=total_attempts,
+                )
+                break
+
+    # Save final draws
+    np.savez(
+        SVAR_DIR / "accepted_draws.npz",
+        vecB=np.array([d["vecB"] for d in accepted]),
+        Sigma=np.array([d["Sigma"] for d in accepted]),
+        B0inv=np.array([d["B0inv"] for d in accepted]),
+        n=n, p=p,
+    )
+    print(f"=== SVAR complete: {len(accepted)} draws saved ===")
