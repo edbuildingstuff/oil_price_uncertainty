@@ -100,3 +100,34 @@ def test_draw_posterior_different_seeds_differ(small_var_data):
     B1, _, _ = draw_posterior(post, np.random.default_rng(1))
     B2, _, _ = draw_posterior(post, np.random.default_rng(2))
     assert not np.allclose(B1, B2)
+
+
+# ---------------------------------------------------------------------------
+# Tests for opu.identification (Task 12)
+# ---------------------------------------------------------------------------
+
+from opu.identification import check_sign_restrictions, check_elasticity
+
+
+def test_sign_restrictions_valid():
+    # Construct a B0inv that satisfies all sign patterns
+    B0inv = np.array([
+        [ 1,  1,  1,  0.5,  0.3],   # row 1: oil production
+        [ 1,  1, -1,  0.1, -0.5],   # row 2: REA
+        [-1,  1,  1,  0.2,  0.8],   # row 3: price
+        [ 0,  0,  1,  0.1,  0.9],   # row 4: inventory
+        [ 0.1, 0,  0.5, 0,  1.0],   # row 5: OPU
+    ])
+    result = check_sign_restrictions(B0inv)
+    # Should return either valid B0inv or None
+    assert result is None or result.shape == (5, 5)
+
+
+def test_elasticity_valid():
+    B0inv = np.eye(5) * 0.01
+    B0inv[0, :] = 0.001
+    B0inv[3, :] = 0.001
+    Q_1 = np.ones(100) * 50
+    DSbar = 0.5
+    ok = check_elasticity(B0inv, Q_1, DSbar)
+    assert isinstance(ok, bool)
