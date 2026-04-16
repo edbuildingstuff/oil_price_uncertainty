@@ -133,25 +133,108 @@ def compute_uy(
 
 
 def build_opu():
-    """Full OPU construction pipeline: fetch data -> forecast errors -> SV -> uncertainty."""
-    from opu.data import load_raw_data
-    from opu.transforms import prepare_missing, zscore, deseasonalize
-    from opu.factors import factors_em
+    """Full OPU construction pipeline."""
+    from opu.data import build_opu_dataset
     from opu.forecast_errors import build_forecast_errors, build_ar_errors, build_np_errors
     from opu.sv import sv_sample
-    from opu.config import OPU_DIR, SV_BURN, SV_DRAWS, SV_THIN, SEED_SV_Y, SEED_SV_F
+    from opu.config import OPU_DIR, PY, SV_BURN, SV_DRAWS, SV_THIN, SEED_SV_Y, SEED_SV_F, OPU_HORIZON
     import time
 
     print("=== Building OPU index ===")
 
-    # Step 1: Load and prepare data
-    print("Step 1: Loading and transforming data...")
-    raw = load_raw_data()
-    # This section will be filled during implementation to:
-    # 1. Align all series to common monthly date index
-    # 2. Apply transformation codes
-    # 3. Z-score
-    # 4. Extract fuel-group factors
-    # 5. Build predictor matrix xt
-    # For now, raise NotImplementedError until data fetching is wired up
-    raise NotImplementedError("Wire up data loading in Task 9")
+    # Load and prepare data
+    print("Step 1: Loading data and building predictors...")
+    ds = build_opu_dataset()
+    yt, xt = ds["yt"], ds["xt"]
+
+    # Baseline forecast errors
+    print("Step 2: Computing forecast errors...")
+    fe = build_forecast_errors(yt, xt)
+    vyt = fe["vyt"]
+    vft = fe["vft"]
+
+    # SV estimation on forecast errors
+    print("Step 3: Estimating stochastic volatility (this may take a while)...")
+    T_fe, N = vyt.shape
+    R = vft.shape[1]
+
+    sv_y_params = []
+    sv_y_latent = []
+    for i in range(N):
+        t0 = time.time()
+        res = sv_sample(vyt[:, i], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_Y + i)
+        sv_y_params.append((res["mu"], res["phi"], res["sigma"]))
+        sv_y_latent.append(res["latent"])
+        print(f"  Oil series {i}: {time.time() - t0:.1f}s")
+
+    sv_f_params = []
+    sv_f_latent = []
+    for i in range(R):
+        t0 = time.time()
+        res = sv_sample(vft[:, i], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_F + i)
+        sv_f_params.append((res["mu"], res["phi"], res["sigma"]))
+        sv_f_latent.append(res["latent"])
+        print(f"  Predictor {i}: {time.time() - t0:.1f}s")
+
+    # Assemble SV outputs
+    thf = np.array([[mu * (1 - phi), phi, sigma ** 2] for mu, phi, sigma in sv_f_params]).T
+    xf = np.column_stack(sv_f_latent)
+    fb = fe["fbetas"]
+
+    thy = np.array([sv_y_params[0][0] * (1 - sv_y_params[0][1]),
+                     sv_y_params[0][1],
+                     sv_y_params[0][2] ** 2])
+    xy = sv_y_latent[0]
+
+    # Uncertainty recursion
+    print("Step 4: Computing uncertainty recursion...")
+    h = OPU_HORIZON
+    evf, phif = compute_uf(xf, thf, fb, h)
+    U = compute_uy(xy, thy, fe["ybetas"][0, :], PY, evf, phif)
+    opu_baseline = np.sqrt(U[:, h - 1])
+
+    # Save
+    dates_opu = ds["dates"][-len(opu_baseline):]
+    np.savez(OPU_DIR / "opu_baseline.npz", opu=opu_baseline, dates=dates_opu)
+    print(f"OPU saved to {OPU_DIR / 'opu_baseline.npz'}, shape={opu_baseline.shape}")
+
+    # AR-only variant
+    print("Step 5: AR-only OPU...")
+    ar_fe = build_ar_errors(yt)
+    ar_sv = sv_sample(ar_fe["vyt"][:, 0], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_Y + 100)
+    ar_thy = np.array([ar_sv["mu"] * (1 - ar_sv["phi"]), ar_sv["phi"], ar_sv["sigma"] ** 2])
+    ar_xy = ar_sv["latent"]
+    T_ar = len(ar_xy)
+    ar_py = ar_fe["ybetas"].shape[1] - 1
+    ar_ut = np.zeros((T_ar, h))
+    for j in range(h):
+        evy_j = expected_var(ar_thy[0], ar_thy[1], ar_thy[2], ar_xy, j + 1)
+        phi_ar = np.zeros((ar_py, ar_py))
+        phi_ar[0, :] = ar_fe["ybetas"][0, 1:]
+        if ar_py > 1:
+            phi_ar[1:, :-1] = np.eye(ar_py - 1)
+        for t in range(T_ar):
+            ev = np.zeros((ar_py, ar_py))
+            ev[0, 0] = evy_j[t]
+            if j == 0:
+                u = ev
+            else:
+                u = phi_ar @ u @ phi_ar.T + ev
+            ar_ut[t, j] = u[0, 0]
+    opu_ar = np.sqrt(ar_ut[:, h - 1])
+    np.savez(OPU_DIR / "opu_ar.npz", opu=opu_ar)
+
+    # No-predictor variant
+    print("Step 6: No-predictor OPU...")
+    np_fe = build_np_errors(yt[:, 0:1])
+    np_sv = sv_sample(np_fe["vyt"][:, 0], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_Y + 200)
+    np_thy = np.array([np_sv["mu"] * (1 - np_sv["phi"]), np_sv["phi"], np_sv["sigma"] ** 2])
+    np_xy = np_sv["latent"]
+    T_np = len(np_xy)
+    np_ut = np.zeros((T_np, h))
+    for j in range(h):
+        np_ut[:, j] = expected_var(np_thy[0], np_thy[1], np_thy[2], np_xy, j + 1)
+    opu_np = np.sqrt(np_ut[:, h - 1])
+    np.savez(OPU_DIR / "opu_np.npz", opu=opu_np)
+
+    print("=== OPU construction complete ===")

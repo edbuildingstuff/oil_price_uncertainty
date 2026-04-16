@@ -3,6 +3,7 @@ import time
 from pathlib import Path
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import requests
 
@@ -201,3 +202,99 @@ def load_raw_data() -> dict[str, pd.DataFrame]:
         if path.exists():
             result[name] = pd.read_parquet(path)
     return result
+
+
+def build_opu_dataset() -> dict:
+    """Assemble the full dataset for OPU construction from cached raw data.
+
+    Returns dict with keys: yt (oil prices), xt (predictors), dates.
+    All series aligned to common monthly index, transformed, z-scored.
+    """
+    from opu.transforms import prepare_missing, zscore
+    from opu.factors import factors_em
+
+    raw = load_raw_data()
+    # Build date index
+    start = pd.Timestamp(f"{SAMPLE_START_YEAR}-{SAMPLE_START_MONTH:02d}-01")
+    end = pd.Timestamp(f"{SAMPLE_END_YEAR}-{SAMPLE_END_MONTH:02d}-01")
+    dates = pd.date_range(start, end, freq="MS")
+
+    def _align(df, dates):
+        # Drop duplicate dates (some EIA series have duplicates) and sort
+        df = df.drop_duplicates(subset="date", keep="first").sort_values("date")
+        df = df.set_index("date").reindex(dates).interpolate(method="linear")
+        # Back/forward fill edges that linear interpolation won't cover
+        df = df.bfill().ffill()
+        return df["value"].values
+
+    def _safe_zscore(x):
+        """Z-score with NaN / constant-series protection."""
+        x = np.asarray(x, dtype=float)
+        if np.all(np.isnan(x)):
+            return np.zeros_like(x)
+        mask = ~np.isnan(x)
+        m = np.mean(x[mask])
+        s = np.std(x[mask], ddof=0)
+        if s < 1e-12:
+            return np.zeros_like(x)
+        out = (x - m) / s
+        # Replace any remaining NaNs with zero (post-standardization)
+        out[np.isnan(out)] = 0.0
+        return out
+
+    # Oil prices (Y sheet equivalent) -- use RAC, energy index, crude avg
+    rac = _align(raw.get("rac", raw.get("CPIAUCSL")), dates)  # fallback
+    energy_idx = _align(raw["PNRGINDEXM"], dates)
+    crude_avg = _align(raw["POILWTIUSDM"], dates)
+
+    # Transformation codes matching original: RAC=5, energy=5, crude_avg=1
+    yt_rac = prepare_missing(rac, tcode=5)
+    yt_energy = prepare_missing(energy_idx, tcode=5)
+    yt_crude = prepare_missing(crude_avg, tcode=1)
+    yt_raw = np.column_stack([yt_rac, yt_energy, yt_crude])
+
+    # Remove first NaN row from log-diff
+    valid = ~np.any(np.isnan(yt_raw), axis=1)
+    first_valid = int(np.argmax(valid))
+    yt_raw = yt_raw[first_valid:]
+    dates_valid = dates[first_valid:]
+
+    yt = np.column_stack([_safe_zscore(yt_raw[:, i]) for i in range(yt_raw.shape[1])])
+
+    # Exchange rates
+    fx_ids = ["DEXUSAL", "EXCAUS", "CCUSSP02CLM650N", "DEXUSNZ", "EXSFUS"]
+    fx = np.column_stack([
+        _safe_zscore(prepare_missing(_align(raw[sid], dates)[first_valid:], tcode=5))
+        if sid in raw else np.zeros(len(dates_valid))
+        for sid in fx_ids
+    ])
+
+    # Other predictors
+    rea = _safe_zscore(prepare_missing(_align(raw["IGREA"], dates)[first_valid:], tcode=1))
+    prod_df = raw.get("production", pd.DataFrame({"date": dates, "value": np.zeros(len(dates))}))
+    stocks_df = raw.get("stocks", pd.DataFrame({"date": dates, "value": np.zeros(len(dates))}))
+    prod = _safe_zscore(prepare_missing(_align(prod_df, dates)[first_valid:], tcode=5))
+    stocks = _safe_zscore(prepare_missing(_align(stocks_df, dates)[first_valid:], tcode=5))
+    m1 = _safe_zscore(prepare_missing(_align(raw["M1SL"], dates)[first_valid:], tcode=5))
+    cpi = _safe_zscore(prepare_missing(_align(raw["CPIAUCSL"], dates)[first_valid:], tcode=5))
+
+    # Fuel group factors
+    coal = _align(raw["PCOALAUUSDM"], dates)[first_valid:]
+    gas_us = _align(raw["PNGASUSUSDM"], dates)[first_valid:]
+    gas_eu = _align(raw["PNGASEUUSDM"], dates)[first_valid:]
+    fuel = np.column_stack([
+        _safe_zscore(prepare_missing(coal, tcode=5)),
+        _safe_zscore(prepare_missing(gas_us, tcode=5)),
+        _safe_zscore(prepare_missing(gas_eu, tcode=5)),
+    ])
+    # Remove NaN rows from fuel
+    fuel_valid = ~np.any(np.isnan(fuel), axis=1)
+    if not np.all(fuel_valid):
+        fuel[~fuel_valid] = 0.0
+
+    _, fhat, _, _, _ = factors_em(fuel, kmax=1, jj=2, demean=2)
+    _, ghat, _, _, _ = factors_em(fuel ** 2, kmax=1, jj=2, demean=2)
+
+    xt = np.column_stack([fx, rea, prod, stocks, m1, cpi, fhat, fhat ** 2, ghat])
+
+    return {"yt": yt, "xt": xt, "dates": dates_valid}
