@@ -10,7 +10,7 @@ def cmd_fetch(args):
 
 def cmd_opu(args):
     from opu.uncertainty import build_opu
-    build_opu()
+    build_opu(workers=args.workers)
 
 
 def cmd_svar(args):
@@ -37,6 +37,8 @@ def main():
     p_fetch.set_defaults(func=cmd_fetch)
 
     p_opu = sub.add_parser("opu")
+    p_opu.add_argument("--workers", type=int, default=None,
+                       help="SV chain workers (default: all CPUs)")
     p_opu.set_defaults(func=cmd_opu)
 
     p_svar = sub.add_parser("svar")

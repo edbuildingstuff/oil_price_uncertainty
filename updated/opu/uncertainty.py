@@ -132,13 +132,28 @@ def compute_uy(
     return U
 
 
-def build_opu():
+def _sv_worker(args):
+    """Picklable worker: run one independent SV chain."""
+    from opu.sv import sv_sample
+    import time
+    vec, draws, burnin, thin, seed, label = args
+    t0 = time.time()
+    res = sv_sample(vec, draws=draws, burnin=burnin, thin=thin, seed=seed)
+    return {
+        "mu": res["mu"], "phi": res["phi"], "sigma": res["sigma"],
+        "latent": res["latent"],
+        "elapsed": time.time() - t0, "label": label,
+    }
+
+
+def build_opu(workers: int | None = None):
     """Full OPU construction pipeline."""
     from opu.data import build_opu_dataset
     from opu.forecast_errors import build_forecast_errors, build_ar_errors, build_np_errors
     from opu.sv import sv_sample
     from opu.config import OPU_DIR, PY, SV_BURN, SV_DRAWS, SV_THIN, SEED_SV_Y, SEED_SV_F, OPU_HORIZON
-    import time
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import os, time
 
     print("=== Building OPU index ===")
 
@@ -153,28 +168,35 @@ def build_opu():
     vyt = fe["vyt"]
     vft = fe["vft"]
 
-    # SV estimation on forecast errors
-    print("Step 3: Estimating stochastic volatility (this may take a while)...")
+    # SV estimation on forecast errors (parallel across independent chains)
     T_fe, N = vyt.shape
     R = vft.shape[1]
+    n_workers = workers if workers is not None else (os.cpu_count() or 1)
+    print(f"Step 3: SV sampling — {N + R} chains across {n_workers} workers...")
 
-    sv_y_params = []
-    sv_y_latent = []
+    jobs = []
     for i in range(N):
-        t0 = time.time()
-        res = sv_sample(vyt[:, i], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_Y + i)
-        sv_y_params.append((res["mu"], res["phi"], res["sigma"]))
-        sv_y_latent.append(res["latent"])
-        print(f"  Oil series {i}: {time.time() - t0:.1f}s")
-
-    sv_f_params = []
-    sv_f_latent = []
+        jobs.append((vyt[:, i], SV_DRAWS, SV_BURN, SV_THIN, SEED_SV_Y + i, f"oil-{i}"))
     for i in range(R):
-        t0 = time.time()
-        res = sv_sample(vft[:, i], draws=SV_DRAWS, burnin=SV_BURN, thin=SV_THIN, seed=SEED_SV_F + i)
-        sv_f_params.append((res["mu"], res["phi"], res["sigma"]))
-        sv_f_latent.append(res["latent"])
-        print(f"  Predictor {i}: {time.time() - t0:.1f}s")
+        jobs.append((vft[:, i], SV_DRAWS, SV_BURN, SV_THIN, SEED_SV_F + i, f"pred-{i}"))
+
+    t_start = time.time()
+    results = [None] * len(jobs)
+    with ProcessPoolExecutor(max_workers=n_workers) as ex:
+        futures = {ex.submit(_sv_worker, job): idx for idx, job in enumerate(jobs)}
+        completed = 0
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+            completed += 1
+            r = results[idx]
+            print(f"  [{completed}/{len(jobs)}] {r['label']}: {r['elapsed']:.1f}s")
+    print(f"  SV total wall time: {time.time() - t_start:.1f}s")
+
+    sv_y_params = [(r["mu"], r["phi"], r["sigma"]) for r in results[:N]]
+    sv_y_latent = [r["latent"] for r in results[:N]]
+    sv_f_params = [(r["mu"], r["phi"], r["sigma"]) for r in results[N:]]
+    sv_f_latent = [r["latent"] for r in results[N:]]
 
     # Assemble SV outputs
     thf = np.array([[mu * (1 - phi), phi, sigma ** 2] for mu, phi, sigma in sv_f_params]).T
