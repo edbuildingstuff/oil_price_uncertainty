@@ -105,3 +105,44 @@ Running record of design options considered and choices made during the OPU repl
 
 **Decision:** B — `oil_price_uncertainty/updated/`.
 **Rationale:** The original replication bundle is already nested under `Codes_CNT_2022_JAE/`, providing clear separation. Keeping the updated code as a sibling subdirectory under the same research project root maintains logical grouping and simplifies navigation.
+
+---
+
+## D8: Parallelism strategy
+
+**Date:** 2026-04-16
+**Context:** Two compute-bound stages dominate runtime: (1) stochastic-volatility sampling for the OPU index — 20 independent MCMC chains, each 100k iterations (50k burn + 50k draws, thin=10); (2) the SVAR rotation search — for each accepted posterior draw, thousands of QR rotations are tested against sign / elasticity / dynamic-sign / narrative restrictions. Sequential execution of stage (1) alone took hours on the development machine (AMD Ryzen 7 7800X3D, 8 cores / 16 threads).
+
+**Options:**
+- A — Single-process, single-thread. Matches original MATLAB scripts without `parfor`. Simplest, slowest.
+- B — Thread-based parallelism (`concurrent.futures.ThreadPoolExecutor`). Shares memory, but NumPy-heavy MCMC is bottlenecked by the GIL on the Python-side loop overhead.
+- C — Process-based parallelism (`concurrent.futures.ProcessPoolExecutor` for SV, `multiprocessing.Pool` for SVAR rotations). Each worker gets its own interpreter; no GIL contention; pickling overhead for job args is negligible compared to chain runtime.
+
+**Decision:** C — Process-based parallelism in both stages.
+**Rationale:** SV chains are embarrassingly parallel — each operates on an independent residual vector and has no shared state. SVAR rotations are similarly independent within a posterior draw. Process-based parallelism sidesteps the GIL entirely and fits the Windows spawn-based multiprocessing model (picklable module-level workers: `opu.uncertainty._sv_worker` and `opu.svar._worker_rotation`). Seed determinism is preserved by (a) assigning each job an index-keyed seed (`SEED_SV_Y + i`, `SEED_SV_F + i`) and (b) populating the `results` list by completion order via `as_completed` but writing into the index slot, so the output is insensitive to which worker finishes first. Workers default to `os.cpu_count()` for OPU (exposed via `run.py opu --workers N`) and 8 for SVAR (`--workers` flag on `svar`), matching the physical-core count on the development machine.
+
+*Wall-time impact:* OPU construction dropped from hours to minutes (scaling limited by the longest single chain once chains ≤ workers). SVAR rotation throughput scales near-linearly with workers in the inner loop.
+
+Commit: `1a2920a perf: parallelize SV chain sampling in build_opu` (SVAR parallelism was already in place from the original main-loop task).
+
+---
+
+## D9: SV inner-loop acceleration
+
+**Date:** 2026-04-16
+**Context:** After parallelization (D8), the per-chain wall time remained the dominant cost at multi-minute durations per chain. Profiling attributed the cost to two Python-level tight loops inside `sv_sample`: the mixture-indicator inverse-CDF sampler and the forward-filter-backward-sample (FFBS) Kalman recursion. Both iterate over T ≈ 610 months with constant-time inner work per step — the overhead is Python bytecode dispatch, not numerical work.
+
+**Options:**
+- A — Status quo (NumPy vectorization only). FFBS has a sequential data dependency (`h_filt[t]` depends on `h_filt[t-1]`) that cannot be vectorized across time, so the tight loop stays in Python.
+- B — Rewrite in Cython or C extension. Maximum speed, heavyweight build toolchain requirement, fragile on Windows.
+- C — GPU (CUDA via CuPy or JAX). Per-iteration work is tiny (T ≈ 610 univariate updates, 5×5 SVAR matrices); kernel launch overhead dominates. Poor fit for sequential MCMC at this scale.
+- D — Numba `@njit` with `cache=True`. Drop-in JIT compilation of the tight loops, compiles once per worker and caches the result on disk, no new dependencies beyond `numba`.
+
+**Decision:** D — Numba JIT on `_sample_indicators_jit` and `_ffbs_jit`.
+**Rationale:** Numba removes Python interpreter overhead from the per-t loops without requiring a rewrite or a compile toolchain. `cache=True` amortizes the compile cost across worker processes after the first call. The sequential FFBS data dependency is preserved — we JIT the loop itself rather than trying to parallelize across time. Determinism is preserved by pre-drawing the per-iteration random variates in the NumPy `Generator` (outside the JIT'd function) and passing them in as arrays: `rng.random(T)` for mixture-indicator uniforms, `rng.standard_normal(T)` for FFBS state noise. This keeps bit-exact reproducibility under a fixed seed while letting the hot loop run in compiled code.
+
+*Measured impact (T = 600, 2000 iterations):* ~2–4 ms/iter → ~0.085 ms/iter, a 25–50× per-chain speedup. Projected over 100k iterations: ~8.5 seconds per chain. Combined with D8, end-to-end OPU construction (20 chains, 8 workers) dropped from hours to roughly one minute.
+
+*Why not GPU:* The SV sampler is sequential MCMC with small per-iteration work (T ≈ 610 scalar Kalman steps); GPU kernel launch latency would exceed the work done per launch. The SVAR stage operates on 5×5 matrices — far below the break-even point for GPU offload. Numba gives most of the available speedup without the complexity.
+
+Commit: `cb72b83 perf: JIT-compile FFBS and mixture-indicator sampling with Numba`.
