@@ -5,6 +5,7 @@ Model:
     h_t = mu + phi*(h_{t-1} - mu) + sigma*eta_t,    eta_t ~ N(0,1)
 """
 import numpy as np
+from numba import njit
 
 # KSC (1998) Table 4: 10-component mixture approximation to log(chi2(1))
 KSC_WEIGHTS = np.array([
@@ -58,11 +59,13 @@ def sv_sample(
     save_idx = 0
 
     for iteration in range(total):
-        # Block 1: Sample mixture indicators s_t
-        s = _sample_indicators(ystar, h, rng)
+        # Block 1: Sample mixture indicators s_t (JIT'd with pre-drawn uniforms)
+        u = rng.random(T)
+        s = _sample_indicators_jit(ystar, h, u, KSC_WEIGHTS, KSC_MEANS, KSC_VARS)
 
-        # Block 2: Sample latent states h_t via FFBS
-        h = _ffbs(ystar, s, mu, phi, sigma2, rng)
+        # Block 2: Sample latent states h_t via FFBS (JIT'd with pre-drawn normals)
+        z = rng.standard_normal(T)
+        h = _ffbs_jit(ystar, s, mu, phi, sigma2, z, KSC_MEANS, KSC_VARS)
 
         # Block 3: Sample parameters (mu, phi, sigma2)
         mu, phi, sigma2 = _sample_params(h, rng)
@@ -83,77 +86,80 @@ def sv_sample(
     }
 
 
-def _sample_indicators(ystar: np.ndarray, h: np.ndarray, rng) -> np.ndarray:
-    """Sample mixture component indicators conditional on ystar and h."""
-    T = len(ystar)
-    residual = ystar - h
-    log_probs = np.zeros((T, 10))
+@njit(cache=True)
+def _sample_indicators_jit(ystar, h, uniforms, weights, means, vars_):
+    """Sample mixture indicators via inverse CDF. Uniforms pre-drawn by caller."""
+    T = ystar.shape[0]
+    s = np.zeros(T, dtype=np.int64)
+    log_w = np.empty(10)
+    log_v = np.empty(10)
     for j in range(10):
-        m_j = KSC_MEANS[j] + _LOG_CHI2_MEAN
-        v_j = KSC_VARS[j]
-        log_probs[:, j] = (
-            np.log(KSC_WEIGHTS[j])
-            - 0.5 * np.log(v_j)
-            - 0.5 * (residual - m_j) ** 2 / v_j
-        )
-    # Normalize
-    log_probs -= log_probs.max(axis=1, keepdims=True)
-    probs = np.exp(log_probs)
-    probs /= probs.sum(axis=1, keepdims=True)
-
-    s = np.zeros(T, dtype=int)
+        log_w[j] = np.log(weights[j])
+        log_v[j] = np.log(vars_[j])
+    log_probs = np.empty(10)
+    probs = np.empty(10)
     for t in range(T):
-        s[t] = rng.choice(10, p=probs[t])
+        resid_t = ystar[t] - h[t]
+        max_lp = -1e300
+        for j in range(10):
+            m_j = means[j] + _LOG_CHI2_MEAN
+            diff = resid_t - m_j
+            lp = log_w[j] - 0.5 * log_v[j] - 0.5 * diff * diff / vars_[j]
+            log_probs[j] = lp
+            if lp > max_lp:
+                max_lp = lp
+        total = 0.0
+        for j in range(10):
+            probs[j] = np.exp(log_probs[j] - max_lp)
+            total += probs[j]
+        u = uniforms[t] * total
+        cum = 0.0
+        sel = 9
+        for j in range(10):
+            cum += probs[j]
+            if u < cum:
+                sel = j
+                break
+        s[t] = sel
     return s
 
 
-def _ffbs(
-    ystar: np.ndarray,
-    s: np.ndarray,
-    mu: float,
-    phi: float,
-    sigma2: float,
-    rng,
-) -> np.ndarray:
-    """Forward-filter backward-sample for latent log-volatility."""
-    T = len(ystar)
-    d = KSC_MEANS[s] + _LOG_CHI2_MEAN
-    R = KSC_VARS[s]
-
-    # Forward filter
+@njit(cache=True)
+def _ffbs_jit(ystar, s, mu, phi, sigma2, z, means, vars_):
+    """FFBS with pre-drawn standard normals z (length T)."""
+    T = ystar.shape[0]
     h_filt = np.zeros(T)
     P_filt = np.zeros(T)
 
-    # t=0: stationary prior
     h_pred = mu
-    P_pred = sigma2 / (1.0 - phi ** 2) if abs(phi) < 0.9999 else sigma2 * 100
+    if abs(phi) < 0.9999:
+        P_pred = sigma2 / (1.0 - phi * phi)
+    else:
+        P_pred = sigma2 * 100.0
 
     for t in range(T):
-        # Update
-        v = ystar[t] - d[t] - h_pred
-        F = P_pred + R[t]
+        d_t = means[s[t]] + _LOG_CHI2_MEAN
+        R_t = vars_[s[t]]
+        v = ystar[t] - d_t - h_pred
+        F = P_pred + R_t
         K = P_pred / F
         h_filt[t] = h_pred + K * v
         P_filt[t] = P_pred * (1.0 - K)
-
-        # Predict next
         if t < T - 1:
             h_pred = mu + phi * (h_filt[t] - mu)
-            P_pred = phi ** 2 * P_filt[t] + sigma2
+            P_pred = phi * phi * P_filt[t] + sigma2
 
-    # Backward sample
     h = np.zeros(T)
-    h[T - 1] = h_filt[T - 1] + np.sqrt(P_filt[T - 1]) * rng.standard_normal()
-
+    h[T - 1] = h_filt[T - 1] + np.sqrt(P_filt[T - 1]) * z[T - 1]
     for t in range(T - 2, -1, -1):
         h_pred_next = mu + phi * (h_filt[t] - mu)
-        P_pred_next = phi ** 2 * P_filt[t] + sigma2
+        P_pred_next = phi * phi * P_filt[t] + sigma2
         J = phi * P_filt[t] / P_pred_next
         h_mean = h_filt[t] + J * (h[t + 1] - h_pred_next)
-        h_var = P_filt[t] - J ** 2 * P_pred_next
-        h_var = max(h_var, 1e-12)
-        h[t] = h_mean + np.sqrt(h_var) * rng.standard_normal()
-
+        h_var = P_filt[t] - J * J * P_pred_next
+        if h_var < 1e-12:
+            h_var = 1e-12
+        h[t] = h_mean + np.sqrt(h_var) * z[t]
     return h
 
 
