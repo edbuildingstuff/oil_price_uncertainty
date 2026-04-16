@@ -141,6 +141,8 @@ from opu.narrative import (
     get_narrative_dates,
     compute_historical_decomposition,
     check_narrative_restrictions,
+    get_extended_narrative_dates,
+    check_extended_narrative,
 )
 
 
@@ -201,4 +203,63 @@ def test_check_narrative_restrictions_returns_bool(narrative_synthetic):
     dates = get_narrative_dates(sample_dates)
     result = check_narrative_restrictions(yhat, dates, B0inv)
     # Accept both Python bool and numpy bool_ (numpy comparisons return np.bool_)
+    assert isinstance(result, (bool, np.bool_))
+
+
+# ---------------------------------------------------------------------------
+# Smoke tests for extended narrative restrictions (Task 18)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def extended_narrative_synthetic():
+    """Synthetic data for extended narrative smoke tests.
+
+    Uses a wide date range (1975-2025, monthly) so get_narrative_dates finds
+    all base episodes, and a large enough array that 2014-16 and 2020 indices
+    exist within bounds.  n=5, p=2, T covers the full date span.
+    """
+    rng = np.random.default_rng(42)
+    n, p = 5, 2
+    # 1975.0 to 2025.0, monthly => 601 entries
+    sample_dates = 1975.0 + np.arange(601) / 12.0
+    T = len(sample_dates)
+    k = 1 + n * p
+    B = rng.standard_normal((n, k)) * 0.05
+    B0inv = np.eye(n) + rng.standard_normal((n, n)) * 0.1
+    Ydep = rng.standard_normal((T, n))
+    X = np.column_stack([np.ones(T), rng.standard_normal((T, n * p))])
+    return sample_dates, B, B0inv, Ydep, X, n, p, T
+
+
+def test_get_extended_narrative_dates_key_count(extended_narrative_synthetic):
+    """get_extended_narrative_dates must return exactly 11 keys (7 base + 4 extended)."""
+    sample_dates, *_ = extended_narrative_synthetic
+    dates = get_extended_narrative_dates(sample_dates)
+    assert len(dates) == 11
+
+
+def test_get_extended_narrative_dates_has_extended_keys(extended_narrative_synthetic):
+    """Extended dict must contain all four new episode keys."""
+    sample_dates, *_ = extended_narrative_synthetic
+    dates = get_extended_narrative_dates(sample_dates)
+    for key in ("id_14M06", "id_16M02", "id_20M01", "id_20M04"):
+        assert key in dates, f"Missing key: {key}"
+
+
+def test_get_extended_narrative_dates_has_base_keys(extended_narrative_synthetic):
+    """Extended dict must also contain all seven base keys."""
+    sample_dates, *_ = extended_narrative_synthetic
+    dates = get_extended_narrative_dates(sample_dates)
+    for key in ("id_90M10", "id_90M06", "id_90M07",
+                "id_79M05", "id_79M12", "id_85M12", "id_86M12"):
+        assert key in dates, f"Missing base key: {key}"
+
+
+def test_check_extended_narrative_returns_bool(extended_narrative_synthetic):
+    """check_extended_narrative must return a bool for synthetic input."""
+    sample_dates, B, B0inv, Ydep, X, n, p, T = extended_narrative_synthetic
+    yhat = compute_historical_decomposition(B, B0inv, Ydep, X, n, p)
+    dates = get_extended_narrative_dates(sample_dates)
+    result = check_extended_narrative(yhat, dates)
     assert isinstance(result, (bool, np.bool_))

@@ -105,3 +105,35 @@ def check_narrative_restrictions(
     ) < -0.15
 
     return nr1 and nr2 and nr3 and nr4 and nr5
+
+
+def get_extended_narrative_dates(sample_dates: np.ndarray) -> dict:
+    """Date indices for robustness narrative episodes (2014-16, 2020)."""
+    def _find(year):
+        return np.argmin(np.abs(sample_dates - year))
+
+    base = get_narrative_dates(sample_dates)
+    base.update({
+        "id_14M06": _find(2014 + 6 / 12),
+        "id_16M02": _find(2016 + 2 / 12),
+        "id_20M01": _find(2020 + 1 / 12),
+        "id_20M04": _find(2020 + 4 / 12),
+    })
+    return base
+
+
+def check_extended_narrative(yhat: dict, dates: dict) -> bool:
+    """Check extended narrative restrictions (original + 2014-16, 2020)."""
+    if not check_narrative_restrictions(yhat, dates, None):
+        return False
+
+    yhat1 = yhat["supply"]
+    yhat2 = yhat["flow_demand"]
+
+    # 2014-16 OPEC collapse: flow supply raised price (supply expansion depressed price)
+    nr6 = (yhat1[dates["id_16M02"]] - yhat1[dates["id_14M06"]]) > 0.05
+
+    # 2020 COVID: flow demand lowered price significantly
+    nr7 = (yhat2[dates["id_20M04"]] - yhat2[dates["id_20M01"]]) < -0.1
+
+    return nr6 and nr7
